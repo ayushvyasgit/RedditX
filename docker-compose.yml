@@ -1,0 +1,264 @@
+services:
+
+  # ============================================================================
+  # FRONTEND (Next.js)
+  # ============================================================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: comments-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      # Browser-side calls (must be localhost — user's browser can't reach container name)
+      - NEXT_PUBLIC_API_URL=http://localhost:8080
+      # Server-side calls (inside Docker network — use service name)
+      - API_URL=http://comments-service:8080
+    networks:
+      - comments-network
+    depends_on:
+      comments-service:
+        condition: service_healthy   # wait for backend to be ready
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s             # Next.js needs time to start
+
+  # ============================================================================
+  # BACKEND (Go - comments-service)
+  # ============================================================================
+  comments-service:
+    build:
+      context: ./backend/comments-service
+      dockerfile: Dockerfile
+    container_name: comments-service
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - ./backend/comments-service/.env
+    networks:
+      - comments-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy   # added rabbitmq dependency
+
+  # ============================================================================
+  # POSTGRESQL PRIMARY (WRITE)
+  # ============================================================================
+  postgres-primary:
+    image: postgres:16-alpine
+    container_name: comments-db-primary
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: comments_service
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-primary-data:/var/lib/postgresql/data
+      - ./backend/comments-service/migrations:/docker-entrypoint-initdb.d:ro
+    networks:
+      - comments-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=200"
+      - "-c"
+      - "shared_buffers=256MB"
+      - "-c"
+      - "wal_level=replica"
+      - "-c"
+      - "max_wal_senders=3"
+
+  # ============================================================================
+  # POSTGRESQL REPLICA (READ)
+  # ============================================================================
+  postgres-replica:
+    image: postgres:16-alpine
+    container_name: comments-db-replica
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-replica-data:/var/lib/postgresql/data
+    networks:
+      - comments-network
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+
+  # ============================================================================
+  # REDIS
+  # ============================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: comments-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - comments-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+
+  # ============================================================================
+  # RABBITMQ
+  # ============================================================================
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: comments-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin
+      RABBITMQ_DEFAULT_VHOST: comments
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    networks:
+      - comments-network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ============================================================================
+  # PROMETHEUS
+  # ============================================================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: comments-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./backend/comments-service/monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks:
+      - comments-network
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+
+  # ============================================================================
+  # GRAFANA (port 3001 — avoids conflict with Next.js on 3000)
+  # ============================================================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: comments-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: http://localhost:3001
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./backend/comments-service/monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./backend/comments-service/monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    networks:
+      - comments-network
+    depends_on:
+      - prometheus
+
+  # ============================================================================
+  # PGADMIN
+  # ============================================================================
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: comments-pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@gmail.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+    networks:
+      - comments-network
+    depends_on:
+      - postgres-primary
+
+  # ============================================================================
+  # REDIS COMMANDER
+  # ============================================================================
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: comments-redis-commander
+    restart: unless-stopped
+    environment:
+      REDIS_HOSTS: local:redis:6379
+    ports:
+      - "8081:8081"
+    networks:
+      - comments-network
+    depends_on:
+      - redis
+
+# ============================================================================
+# VOLUMES
+# ============================================================================
+volumes:
+  postgres-primary-data:
+  postgres-replica-data:
+  redis-data:
+  rabbitmq-data:
+  prometheus-data:
+  grafana-data:
+  pgadmin-data:
+
+# ============================================================================
+# NETWORKS
+# ============================================================================
+networks:
+  comments-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.25.0.0/16
